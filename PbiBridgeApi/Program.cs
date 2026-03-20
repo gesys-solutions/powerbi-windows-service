@@ -15,6 +15,12 @@ builder.Services.AddControllers();
 // Register IApiKeyStore as singleton (in-memory, thread-safe ConcurrentDictionary)
 builder.Services.AddSingleton<IApiKeyStore, InMemoryApiKeyStore>();
 
+// DA-014: JobManager — strict client_id isolation (a client never sees another's jobs)
+// DA-016: JobCleanupService — automatic cleanup of jobs older than 48h
+builder.Services.AddSingleton<JobManager>();
+builder.Services.AddSingleton<IJobManager>(sp => sp.GetRequiredService<JobManager>());
+builder.Services.AddHostedService<JobCleanupService>();
+
 var app = builder.Build();
 
 // DA-013: X-API-Key middleware — all routes except /health
