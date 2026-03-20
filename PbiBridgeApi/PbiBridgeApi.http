@@ -1,0 +1,6 @@
+@PbiBridgeApi_HostAddress = http://localhost:5099
+
+GET {{PbiBridgeApi_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###
