@@ -1,4 +1,5 @@
-using PbiBridgeApi.Controllers;
+using PbiBridgeApi.Middleware;
+using PbiBridgeApi.Services;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -10,9 +11,15 @@ builder.Host.UseWindowsService();
 
 builder.Services.AddControllers();
 
+// DA-017: ADMIN_API_KEY validation happens inside ApiKeyMiddleware constructor
+// Register IApiKeyStore as singleton (in-memory, thread-safe ConcurrentDictionary)
+builder.Services.AddSingleton<IApiKeyStore, InMemoryApiKeyStore>();
+
 var app = builder.Build();
 
-app.UseHttpsRedirection();
+// DA-013: X-API-Key middleware — all routes except /health
+app.UseMiddleware<ApiKeyMiddleware>();
+
 app.MapControllers();
 
 app.Run();
