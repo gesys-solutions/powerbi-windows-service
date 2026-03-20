@@ -1,0 +1,15 @@
+## .NET gitignore
+bin/
+obj/
+*.user
+*.suo
+.vs/
+*.userprefs
+*.DS_Store
+publish/
+
+## Environment / secrets
+.env
+*.env.local
+appsettings.Local.json
+appsettings.*.local.json

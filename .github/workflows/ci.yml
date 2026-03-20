@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [ "**" ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore dependencies
+        run: dotnet restore PbiBridgeApi/PbiBridgeApi.csproj
+
+      - name: Build
+        run: dotnet build PbiBridgeApi/PbiBridgeApi.csproj --no-restore --configuration Release
+
+      - name: Test
+        run: |
+          if [ -d "PbiBridgeApi.Tests" ]; then
+            dotnet test PbiBridgeApi.Tests/PbiBridgeApi.Tests.csproj --no-build --verbosity normal
+          else
+            echo "No test project yet — skipping (will be added in S2.2+)"
+          fi
