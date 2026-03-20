@@ -21,6 +21,9 @@ builder.Services.AddSingleton<JobManager>();
 builder.Services.AddSingleton<IJobManager>(sp => sp.GetRequiredService<JobManager>());
 builder.Services.AddHostedService<JobCleanupService>();
 
+// DA-015: ConversionService — calls tableau2pbi Python subprocess (never reimplements logic)
+builder.Services.AddSingleton<IConversionService, ConversionService>();
+
 var app = builder.Build();
 
 // DA-013: X-API-Key middleware — all routes except /health
