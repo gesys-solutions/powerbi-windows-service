@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Text;
+using Microsoft.Extensions.Options;
 
 namespace PbiBridgeApi.Services;
 
@@ -15,12 +16,13 @@ public sealed class ConversionService : IConversionService
     private readonly int _timeoutMinutes;
     private readonly ILogger<ConversionService> _logger;
 
-    public ConversionService(IConfiguration configuration, ILogger<ConversionService> logger)
+    public ConversionService(IOptions<ConversionOptions> options, ILogger<ConversionService> logger)
     {
         _logger = logger;
-        _pythonPath = configuration["Conversion:PythonPath"] ?? "python";
-        _tableau2PbiPath = configuration["Conversion:Tableau2PbiPath"] ?? string.Empty;
-        _timeoutMinutes = int.TryParse(configuration["Conversion:JobTimeoutMinutes"], out var t) ? t : 10;
+        var opts = options.Value;
+        _pythonPath = string.IsNullOrWhiteSpace(opts.PythonPath) ? "python" : opts.PythonPath;
+        _tableau2PbiPath = opts.Tableau2PbiPath ?? string.Empty;
+        _timeoutMinutes = opts.JobTimeoutMinutes > 0 ? opts.JobTimeoutMinutes : 10;
     }
 
     /// <inheritdoc />
@@ -44,7 +46,8 @@ public sealed class ConversionService : IConversionService
             args = $"\"{_tableau2PbiPath}\" --input \"{sourcePath}\" --output \"{outputPath}\"";
         }
 
-        _logger.LogInformation("Launching subprocess: {Python} {Args}", _pythonPath, args);
+        // Minor: log subprocess invocation at Debug level only — avoids leaking paths in Info logs
+        _logger.LogDebug("Launching subprocess: {Python} {Args}", _pythonPath, args);
 
         var psi = new ProcessStartInfo
         {
@@ -93,8 +96,11 @@ public sealed class ConversionService : IConversionService
         var exitCode = process.ExitCode;
 
         _logger.LogInformation("Subprocess exited with code {Code}", exitCode);
+
+        // Minor: stderr may contain sensitive data — log at Debug level only
         if (!string.IsNullOrWhiteSpace(stderr))
-            _logger.LogWarning("Subprocess stderr: {Stderr}", stderr);
+            _logger.LogDebug("Subprocess stderr (first 500 chars): {Stderr}",
+                stderr.Length > 500 ? stderr[..500] + "…" : stderr);
 
         return (stdout, stderr, exitCode);
     }

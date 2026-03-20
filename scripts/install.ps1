@@ -14,7 +14,7 @@
     Required. The admin API key for managing client keys.
 
 .PARAMETER Port
-    Service port. Default: 8090. DA-012: DO NOT CHANGE.
+    Service port. MUST be 8090. DA-012: DO NOT CHANGE. Validated strictly.
 
 .PARAMETER InstallDir
     Publish output directory. Default: C:\Services\PbiBridgeApi\
@@ -44,6 +44,12 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+
+# DA-012: Port 8090 ONLY — reject any other value immediately
+if ($Port -ne 8090) {
+    Write-Error "DA-012 violation: Port must be 8090. Received: $Port. The service is hardcoded to port 8090 and cannot be changed."
+    exit 1
+}
 
 Write-Host "=== PbiBridgeApi Install ===" -ForegroundColor Cyan
 
@@ -139,12 +145,23 @@ if ($UseNssm) {
     }
     & sc.exe description $ServiceName "Power BI Bridge API - ASP.NET Core .NET 8 Windows Service (ADR-002)" | Out-Null
 
-    # Set env vars via registry for non-NSSM installs
-    # DA-017: set ADMIN_API_KEY in the service's registry environment
+    # DA-017: set ADMIN_API_KEY + ASPNETCORE_ENVIRONMENT via registry MultiString for sc.exe services.
+    # Use a proper string[] (PowerShell native), NOT a byte array — avoids corrupt MultiString values.
     $RegPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
-    $EnvValue = "ADMIN_API_KEY=$AdminApiKey`0ASPNETCORE_ENVIRONMENT=Production`0"
-    Set-ItemProperty -Path $RegPath -Name "Environment" -Value ([System.Text.Encoding]::Unicode.GetBytes($EnvValue)) -Type MultiString
-    Write-Host "  Environment variables set in registry." -ForegroundColor Gray
+    $EnvVars = @(
+        "ADMIN_API_KEY=$AdminApiKey",
+        "ASPNETCORE_ENVIRONMENT=Production"
+    )
+    Set-ItemProperty -Path $RegPath -Name "Environment" -Value $EnvVars -Type MultiString
+    Write-Host "  Environment variables set in registry (MultiString)." -ForegroundColor Gray
+
+    # Verify the registry value was written correctly (explicit fallback test)
+    $Written = (Get-ItemProperty -Path $RegPath -Name "Environment" -ErrorAction SilentlyContinue).Environment
+    if ($null -eq $Written -or $Written -notcontains "ADMIN_API_KEY=$AdminApiKey") {
+        Write-Error "Registry verification failed: ADMIN_API_KEY was not written correctly. Check permissions on $RegPath."
+        exit 1
+    }
+    Write-Host "  Registry verification: ADMIN_API_KEY confirmed written." -ForegroundColor Gray
 }
 
 Write-Host "  Service created OK" -ForegroundColor Green

@@ -4,7 +4,7 @@ namespace PbiBridgeApi.Middleware;
 
 /// <summary>
 /// Middleware that enforces X-API-Key authentication on all routes except GET /health.
-/// DA-013: X-API-Key obligatoire sauf GET /health.
+/// DA-013: X-API-Key obligatoire sauf GET /health (GET uniquement, pas les autres verbes).
 /// DA-017: ADMIN_API_KEY lu depuis variable d'environnement.
 /// </summary>
 public class ApiKeyMiddleware
@@ -39,8 +39,9 @@ public class ApiKeyMiddleware
         var path = context.Request.Path.Value ?? string.Empty;
         var method = context.Request.Method;
 
-        // DA-013: /health is exempt (any method)
-        if (path.Equals("/health", StringComparison.OrdinalIgnoreCase))
+        // DA-013: only GET /health is exempt — other verbs on /health require auth
+        if (HttpMethods.IsGet(method) &&
+            path.Equals("/health", StringComparison.OrdinalIgnoreCase))
         {
             await _next(context);
             return;

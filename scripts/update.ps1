@@ -17,7 +17,7 @@
     Service install directory. Default: C:\Services\PbiBridgeApi\
 
 .PARAMETER Port
-    Service port. Default: 8090.
+    Service port. MUST be 8090. DA-012: validated strictly.
 
 .EXAMPLE
     .\scripts\update.ps1
@@ -38,6 +38,12 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+
+# DA-012: Port 8090 ONLY — reject any other value immediately
+if ($Port -ne 8090) {
+    Write-Error "DA-012 violation: Port must be 8090. Received: $Port. The service is hardcoded to port 8090."
+    exit 1
+}
 
 Write-Host "=== PbiBridgeApi Update ===" -ForegroundColor Cyan
 

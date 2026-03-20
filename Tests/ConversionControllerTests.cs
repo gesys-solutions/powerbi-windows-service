@@ -2,6 +2,7 @@ using System.Text;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Options;
 using PbiBridgeApi.Controllers;
 using PbiBridgeApi.Models;
 using PbiBridgeApi.Services;
@@ -40,16 +41,29 @@ public sealed class MockConversionService : IConversionService
 
 internal static class ControllerFactory
 {
+    /// <summary>
+    /// Workspace root used by all tests.
+    /// Paths must start with {WorkspaceRoot}/{clientId}/ to pass path validation.
+    /// </summary>
+    public static readonly string TestWorkspaceRoot = "/tmp/pbi-test-workspaces";
+
     /// <summary>Build a ConversionController with the client_id pre-injected in HttpContext.Items.</summary>
     public static ConversionController Create(
         IJobManager jobManager,
         IConversionService conversionService,
-        string clientId = "acme")
+        string clientId = "acme",
+        string? workspaceRoot = null)
     {
+        var opts = Options.Create(new ConversionOptions
+        {
+            WorkspaceRootPath = workspaceRoot ?? TestWorkspaceRoot,
+        });
+
         var controller = new ConversionController(
             jobManager,
             conversionService,
-            NullLogger<ConversionController>.Instance);
+            NullLogger<ConversionController>.Instance,
+            opts);
 
         var httpContext = new DefaultHttpContext();
         httpContext.Response.Body = new MemoryStream();
@@ -68,10 +82,16 @@ internal static class ControllerFactory
         IJobManager jobManager,
         IConversionService conversionService)
     {
+        var opts = Options.Create(new ConversionOptions
+        {
+            WorkspaceRootPath = TestWorkspaceRoot,
+        });
+
         var controller = new ConversionController(
             jobManager,
             conversionService,
-            NullLogger<ConversionController>.Instance);
+            NullLogger<ConversionController>.Instance,
+            opts);
 
         var httpContext = new DefaultHttpContext();
         httpContext.Response.Body = new MemoryStream();
@@ -84,6 +104,14 @@ internal static class ControllerFactory
 
         return controller;
     }
+
+    /// <summary>Build a valid source path for client under the test workspace.</summary>
+    public static string ValidSourcePath(string clientId = "acme", string file = "report.twb")
+        => $"{TestWorkspaceRoot}/{clientId}/{file}";
+
+    /// <summary>Build a valid output path for client under the test workspace.</summary>
+    public static string ValidOutputPath(string clientId = "acme", string file = "report.pbix")
+        => $"{TestWorkspaceRoot}/{clientId}/output/{file}";
 }
 
 // ── POST /v1/migrate tests ────────────────────────────────────────────────────
@@ -105,8 +133,8 @@ public class MigrateEndpointTests
         var controller = ControllerFactory.Create(_jobManager, _mockConversion);
         var request = new MigrateRequest
         {
-            SourcePath = "/data/report.twb",
-            OutputPath = "/output/report.pbix",
+            SourcePath = ControllerFactory.ValidSourcePath(),
+            OutputPath = ControllerFactory.ValidOutputPath(),
         };
 
         var result = controller.Migrate(request) as AcceptedResult;
@@ -126,8 +154,8 @@ public class MigrateEndpointTests
         var controller = ControllerFactory.CreateUnauthenticated(_jobManager, _mockConversion);
         var request = new MigrateRequest
         {
-            SourcePath = "/data/report.twb",
-            OutputPath = "/output/report.pbix",
+            SourcePath = ControllerFactory.ValidSourcePath(),
+            OutputPath = ControllerFactory.ValidOutputPath(),
         };
 
         var result = controller.Migrate(request) as UnauthorizedObjectResult;
@@ -142,7 +170,7 @@ public class MigrateEndpointTests
         var controller = ControllerFactory.Create(_jobManager, _mockConversion);
         controller.ModelState.AddModelError("source_path", "Required");
 
-        var request = new MigrateRequest { SourcePath = "", OutputPath = "/output/report.pbix" };
+        var request = new MigrateRequest { SourcePath = "", OutputPath = ControllerFactory.ValidOutputPath() };
 
         var result = controller.Migrate(request) as BadRequestObjectResult;
 
@@ -156,8 +184,8 @@ public class MigrateEndpointTests
         var controller = ControllerFactory.Create(_jobManager, _mockConversion, clientId: "acme");
         var request = new MigrateRequest
         {
-            SourcePath = "/data/test.twb",
-            OutputPath = "/output/test.pbix",
+            SourcePath = ControllerFactory.ValidSourcePath("acme", "test.twb"),
+            OutputPath = ControllerFactory.ValidOutputPath("acme", "test.pbix"),
         };
 
         var result = controller.Migrate(request) as AcceptedResult;
@@ -299,5 +327,184 @@ public class GetResultEndpointTests
 
         Assert.NotNull(result);
         Assert.Equal(StatusCodes.Status404NotFound, result.StatusCode);
+    }
+}
+
+// ── PathGuard unit tests (Blocker 1 — filesystem isolation) ──────────────────
+
+public class PathGuardTests
+{
+    private const string WorkspaceRoot = "/tmp/pbi-test-workspaces";
+    private const string ClientId = "acme";
+
+    // ── Valid paths ──────────────────────────────────────────────────────────
+
+    [Fact]
+    public void Validate_ValidPath_ReturnsTrue()
+    {
+        var (ok, err) = PathGuard.Validate(
+            $"{WorkspaceRoot}/{ClientId}/input.twb",
+            ClientId,
+            WorkspaceRoot);
+
+        Assert.True(ok, $"Expected valid — got error: {err}");
+        Assert.Empty(err);
+    }
+
+    [Fact]
+    public void Validate_ValidNestedPath_ReturnsTrue()
+    {
+        var (ok, err) = PathGuard.Validate(
+            $"{WorkspaceRoot}/{ClientId}/subdir/deep/file.twb",
+            ClientId,
+            WorkspaceRoot);
+
+        Assert.True(ok, $"Expected valid — got error: {err}");
+    }
+
+    // ── Path traversal attacks ───────────────────────────────────────────────
+
+    [Fact]
+    public void Validate_PathTraversal_DotDot_ReturnsFalse()
+    {
+        // ../evil would resolve to /tmp/pbi-test-workspaces/evil — outside acme sandbox
+        var traversalPath = $"{WorkspaceRoot}/{ClientId}/../evil/file.twb";
+
+        var (ok, err) = PathGuard.Validate(traversalPath, ClientId, WorkspaceRoot);
+
+        Assert.False(ok, "Path traversal via .. must be rejected.");
+        Assert.NotEmpty(err);
+    }
+
+    [Fact]
+    public void Validate_PathTraversal_EscapesWorkspace_ReturnsFalse()
+    {
+        // Tries to reach another client's workspace
+        var traversalPath = $"{WorkspaceRoot}/{ClientId}/../../other-client/secret.twb";
+
+        var (ok, err) = PathGuard.Validate(traversalPath, ClientId, WorkspaceRoot);
+
+        Assert.False(ok, "Path traversal escaping workspace must be rejected.");
+    }
+
+    [Fact]
+    public void Validate_SystemPath_ReturnsFalse()
+    {
+        // Absolute path outside the workspace entirely
+        var (ok, err) = PathGuard.Validate("/etc/passwd", ClientId, WorkspaceRoot);
+
+        Assert.False(ok, "System path must be rejected.");
+        Assert.NotEmpty(err);
+    }
+
+    [Fact]
+    public void Validate_OtherClientPath_ReturnsFalse()
+    {
+        // Trying to access another client's sandbox directly
+        var (ok, err) = PathGuard.Validate(
+            $"{WorkspaceRoot}/other-client/file.twb",
+            ClientId,     // ClientId = "acme"
+            WorkspaceRoot);
+
+        Assert.False(ok, "Another client's path must be rejected for the requesting client.");
+    }
+
+    // ── UNC paths ────────────────────────────────────────────────────────────
+
+    [Fact]
+    public void Validate_UncPath_ReturnsFalse()
+    {
+        var (ok, err) = PathGuard.Validate(@"\\server\share\file.twb", ClientId, WorkspaceRoot);
+
+        Assert.False(ok, "UNC path must be rejected.");
+        Assert.NotEmpty(err);
+    }
+
+    [Fact]
+    public void Validate_UncPath_ForwardSlash_ReturnsFalse()
+    {
+        var (ok, err) = PathGuard.Validate("//server/share/file.twb", ClientId, WorkspaceRoot);
+
+        Assert.False(ok, "UNC path (forward slash) must be rejected.");
+    }
+
+    // ── Edge cases ───────────────────────────────────────────────────────────
+
+    [Fact]
+    public void Validate_EmptyPath_ReturnsFalse()
+    {
+        var (ok, err) = PathGuard.Validate("", ClientId, WorkspaceRoot);
+
+        Assert.False(ok);
+        Assert.NotEmpty(err);
+    }
+
+    [Fact]
+    public void Validate_WhitespacePath_ReturnsFalse()
+    {
+        var (ok, err) = PathGuard.Validate("   ", ClientId, WorkspaceRoot);
+
+        Assert.False(ok);
+        Assert.NotEmpty(err);
+    }
+
+    // ── Controller integration: paths are validated before job creation ──────
+
+    [Fact]
+    public void Migrate_PathTraversal_Returns400()
+    {
+        var jobManager = new JobManager();
+        var mockConversion = new MockConversionService();
+        var controller = ControllerFactory.Create(jobManager, mockConversion, clientId: "acme");
+
+        var request = new MigrateRequest
+        {
+            // Traversal: resolved path escapes the acme sandbox
+            SourcePath = $"{ControllerFactory.TestWorkspaceRoot}/acme/../evil/file.twb",
+            OutputPath = ControllerFactory.ValidOutputPath("acme"),
+        };
+
+        var result = controller.Migrate(request) as BadRequestObjectResult;
+
+        Assert.NotNull(result);
+        Assert.Equal(StatusCodes.Status400BadRequest, result.StatusCode);
+    }
+
+    [Fact]
+    public void Migrate_ValidPathInsideSandbox_Returns202()
+    {
+        var jobManager = new JobManager();
+        var mockConversion = new MockConversionService();
+        var controller = ControllerFactory.Create(jobManager, mockConversion, clientId: "acme");
+
+        var request = new MigrateRequest
+        {
+            SourcePath = ControllerFactory.ValidSourcePath("acme", "data.twb"),
+            OutputPath = ControllerFactory.ValidOutputPath("acme", "data.pbix"),
+        };
+
+        var result = controller.Migrate(request) as AcceptedResult;
+
+        Assert.NotNull(result);
+        Assert.Equal(StatusCodes.Status202Accepted, result.StatusCode);
+    }
+
+    [Fact]
+    public void Migrate_SystemPath_Returns400()
+    {
+        var jobManager = new JobManager();
+        var mockConversion = new MockConversionService();
+        var controller = ControllerFactory.Create(jobManager, mockConversion, clientId: "acme");
+
+        var request = new MigrateRequest
+        {
+            SourcePath = "/etc/passwd",
+            OutputPath = ControllerFactory.ValidOutputPath("acme"),
+        };
+
+        var result = controller.Migrate(request) as BadRequestObjectResult;
+
+        Assert.NotNull(result);
+        Assert.Equal(StatusCodes.Status400BadRequest, result.StatusCode);
     }
 }

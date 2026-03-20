@@ -1,4 +1,5 @@
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Options;
 using PbiBridgeApi.Models;
 using PbiBridgeApi.Services;
 
@@ -7,7 +8,7 @@ namespace PbiBridgeApi.Controllers;
 /// <summary>
 /// S2.4 ConversionController — POST /v1/migrate + GET /v1/status/{jobId} + GET /v1/result/{jobId}.
 /// DA-013: X-API-Key required (enforced by ApiKeyMiddleware — no attribute needed).
-/// DA-014: strict client_id isolation — jobs are invisible across clients.
+/// DA-014: strict client_id isolation — jobs and filesystem paths are sandboxed per client.
 /// DA-015: conversion logic stays in Python subprocess (ConversionService).
 /// </summary>
 [ApiController]
@@ -19,15 +20,18 @@ public class ConversionController : ControllerBase
     private readonly IJobManager _jobManager;
     private readonly IConversionService _conversionService;
     private readonly ILogger<ConversionController> _logger;
+    private readonly ConversionOptions _conversionOptions;
 
     public ConversionController(
         IJobManager jobManager,
         IConversionService conversionService,
-        ILogger<ConversionController> logger)
+        ILogger<ConversionController> logger,
+        IOptions<ConversionOptions> conversionOptions)
     {
         _jobManager = jobManager;
         _conversionService = conversionService;
         _logger = logger;
+        _conversionOptions = conversionOptions.Value;
     }
 
     // -----------------------------------------------------------------------
@@ -37,6 +41,7 @@ public class ConversionController : ControllerBase
     /// <summary>
     /// Queue a new Tableau → Power BI conversion job.
     /// Returns 202 Accepted with the job_id.
+    /// DA-014: source_path and output_path are validated to be inside {WorkspaceRootPath}/{clientId}/.
     /// DA-015: subprocess tableau2pbi called asynchronously in background.
     /// </summary>
     [HttpPost("migrate")]
@@ -52,10 +57,24 @@ public class ConversionController : ControllerBase
         if (clientId is null)
             return Unauthorized(new { error = "client_id missing — auth middleware failed" });
 
+        // DA-014 / Blocker 1: validate paths are within the client's sandbox
+        var (pathsValid, pathError) = PathGuard.ValidateConversionPaths(
+            request.SourcePath,
+            request.OutputPath,
+            clientId,
+            _conversionOptions.WorkspaceRootPath);
+
+        if (!pathsValid)
+        {
+            _logger.LogWarning("[{ClientId}] Path validation rejected request: {Error}", clientId, pathError);
+            return BadRequest(new { error = pathError });
+        }
+
         var jobId = _jobManager.CreateJob(clientId);
 
-        _logger.LogInformation("[{ClientId}] Queuing migration job {JobId}: {Src} -> {Dst}",
-            clientId, jobId, request.SourcePath, request.OutputPath);
+        // Minor: log at Debug level to avoid leaking paths in production logs
+        _logger.LogDebug("[{ClientId}] Queuing migration job {JobId}", clientId, jobId);
+        _logger.LogInformation("[{ClientId}] Conversion job {JobId} queued.", clientId, jobId);
 
         // Fire-and-forget: run subprocess in background, update job status on completion
         _ = RunConversionBackgroundAsync(jobId, clientId, request);
@@ -172,12 +191,15 @@ public class ConversionController : ControllerBase
             }
             else
             {
+                // Minor: stderr may contain sensitive data — log at Warning with truncation
+                var stderrSummary = string.IsNullOrWhiteSpace(stderr)
+                    ? $"Exit code {exitCode}"
+                    : $"Exit code {exitCode}: {stderr.Trim()[..Math.Min(stderr.Trim().Length, 200)]}";
                 var errorMsg = string.IsNullOrWhiteSpace(stderr) ? $"Exit code {exitCode}" : stderr.Trim();
                 _jobManager.UpdateJob(
                     jobId, clientId, Services.JobStatus.Failed,
                     error: errorMsg);
-                _logger.LogWarning("[{ClientId}] Job {JobId} failed (exit {Code}): {Err}",
-                    clientId, jobId, exitCode, errorMsg);
+                _logger.LogWarning("[{ClientId}] Job {JobId} failed: {Summary}", clientId, jobId, stderrSummary);
             }
         }
         catch (Exception ex)

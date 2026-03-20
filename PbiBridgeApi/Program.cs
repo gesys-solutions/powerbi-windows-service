@@ -11,6 +11,9 @@ builder.Host.UseWindowsService();
 
 builder.Services.AddControllers();
 
+// Bind Conversion options (WorkspaceRootPath, PythonPath, etc.)
+builder.Services.Configure<ConversionOptions>(builder.Configuration.GetSection("Conversion"));
+
 // DA-017: ADMIN_API_KEY validation happens inside ApiKeyMiddleware constructor
 // Register IApiKeyStore as singleton (in-memory, thread-safe ConcurrentDictionary)
 builder.Services.AddSingleton<IApiKeyStore, InMemoryApiKeyStore>();
@@ -26,7 +29,7 @@ builder.Services.AddSingleton<IConversionService, ConversionService>();
 
 var app = builder.Build();
 
-// DA-013: X-API-Key middleware — all routes except /health
+// DA-013: X-API-Key middleware — all routes except GET /health
 app.UseMiddleware<ApiKeyMiddleware>();
 
 app.MapControllers();

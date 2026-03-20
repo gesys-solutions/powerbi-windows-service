@@ -83,10 +83,14 @@ public class ApiKeyMiddlewareTests
         return new ApiKeyMiddleware(next, config, store, NullLogger<ApiKeyMiddleware>.Instance);
     }
 
-    private static DefaultHttpContext MakeContext(string? path = "/v1/migrate", string? apiKey = null)
+    private static DefaultHttpContext MakeContext(
+        string? path = "/v1/migrate",
+        string? apiKey = null,
+        string method = "GET")
     {
         var ctx = new DefaultHttpContext();
         ctx.Request.Path = path;
+        ctx.Request.Method = method;
         ctx.Response.Body = new MemoryStream();
         if (apiKey is not null)
             ctx.Request.Headers["X-API-Key"] = apiKey;
@@ -94,16 +98,29 @@ public class ApiKeyMiddlewareTests
     }
 
     [Fact]
-    public async Task HealthEndpoint_ShouldBypassAuth()
+    public async Task HealthEndpoint_GetOnly_ShouldBypassAuth()
     {
         var called = false;
         var mw = BuildMiddleware(_ => { called = true; return Task.CompletedTask; });
-        var ctx = MakeContext("/health");
+        // DA-013: only GET /health is exempt
+        var ctx = MakeContext("/health", method: "GET");
 
         await mw.InvokeAsync(ctx);
 
         Assert.True(called);
         Assert.Equal(200, ctx.Response.StatusCode);
+    }
+
+    [Fact]
+    public async Task HealthEndpoint_PostWithoutKey_ShouldReturn401()
+    {
+        // DA-013 minor fix: POST /health (no auth key) must require auth — only GET is exempt
+        var mw = BuildMiddleware(_ => Task.CompletedTask);
+        var ctx = MakeContext("/health", method: "POST");
+
+        await mw.InvokeAsync(ctx);
+
+        Assert.Equal(401, ctx.Response.StatusCode);
     }
 
     [Fact]
