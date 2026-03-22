@@ -32,9 +32,10 @@ public sealed class ConversionService : IConversionService
         Dictionary<string, object?> options,
         CancellationToken cancellationToken = default)
     {
-        // DA-015: call subprocess — never reimplement the tableau2pbi logic
-        // Command: python -m tableau2pbi.cli --input <src> --output <out>
-        // OR: python <Tableau2PbiPath>/cli.py --input <src> --output <out>
+        // DA-015: call subprocess — never reimplement the tableau2pbi logic.
+        // Current CLI contract comes from src/convert.py:
+        //   python <convert.py> <input> --out <output-dir>
+        // If Tableau2PbiPath is not configured, we keep the legacy module mode for compatibility.
         string args;
         if (string.IsNullOrWhiteSpace(_tableau2PbiPath))
         {
@@ -42,8 +43,7 @@ public sealed class ConversionService : IConversionService
         }
         else
         {
-            // Windows VM path style: python C:\tools\tableau2pbi\cli.py ...
-            args = $"\"{_tableau2PbiPath}\" --input \"{sourcePath}\" --output \"{outputPath}\"";
+            args = $"\"{_tableau2PbiPath}\" \"{sourcePath}\" --out \"{outputPath}\"";
         }
 
         // Minor: log subprocess invocation at Debug level only — avoids leaking paths in Info logs
