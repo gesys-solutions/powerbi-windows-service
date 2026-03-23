@@ -3,13 +3,15 @@ using PbiBridgeApi.Services;
 namespace PbiBridgeApi.Middleware;
 
 /// <summary>
-/// Middleware that enforces X-API-Key authentication on all routes except GET /health.
-/// DA-013: X-API-Key obligatoire sauf GET /health (GET uniquement, pas les autres verbes).
-/// DA-017: ADMIN_API_KEY lu depuis variable d'environnement.
+/// Auth contract:
+/// - GET /health: anonymous
+/// - /admin/*: X-Admin-Key
+/// - /v1/*: X-API-Key (client) or X-Admin-Key (operator)
 /// </summary>
 public class ApiKeyMiddleware
 {
     private const string ApiKeyHeader = "X-API-Key";
+    private const string AdminKeyHeader = "X-Admin-Key";
     private const string ClientIdKey = "client_id";
     private const string AdminClientId = "__admin__";
 
@@ -27,11 +29,8 @@ public class ApiKeyMiddleware
         _next = next;
         _store = store;
         _logger = logger;
-
-        // DA-017: ADMIN_API_KEY must come from env var — never hardcoded
         _adminApiKey = configuration["ADMIN_API_KEY"]
-            ?? throw new InvalidOperationException(
-                "ADMIN_API_KEY environment variable is required and must not be empty.");
+            ?? throw new InvalidOperationException("ADMIN_API_KEY environment variable is required and must not be empty.");
     }
 
     public async Task InvokeAsync(HttpContext context)
@@ -39,11 +38,23 @@ public class ApiKeyMiddleware
         var path = context.Request.Path.Value ?? string.Empty;
         var method = context.Request.Method;
 
-        // DA-013: only GET /health is exempt — other verbs on /health require auth
-        if (HttpMethods.IsGet(method) &&
-            path.Equals("/health", StringComparison.OrdinalIgnoreCase))
+        if (HttpMethods.IsGet(method) && path.Equals("/health", StringComparison.OrdinalIgnoreCase))
         {
             await _next(context);
+            return;
+        }
+
+        if (TryAuthenticateAdmin(context))
+        {
+            await _next(context);
+            return;
+        }
+
+        if (path.StartsWith("/admin", StringComparison.OrdinalIgnoreCase))
+        {
+            _logger.LogWarning("Missing or invalid X-Admin-Key for {Method} {Path}", method, path);
+            context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+            await context.Response.WriteAsJsonAsync(new { error = "Missing or invalid X-Admin-Key header" });
             return;
         }
 
@@ -57,16 +68,6 @@ public class ApiKeyMiddleware
         }
 
         var key = extractedKey.ToString();
-
-        // ADMIN_API_KEY: full access
-        if (key == _adminApiKey)
-        {
-            context.Items[ClientIdKey] = AdminClientId;
-            await _next(context);
-            return;
-        }
-
-        // Client key lookup
         if (_store.TryGetClientId(key, out var clientId))
         {
             context.Items[ClientIdKey] = clientId;
@@ -77,5 +78,22 @@ public class ApiKeyMiddleware
         _logger.LogWarning("Invalid X-API-Key for {Method} {Path}", method, path);
         context.Response.StatusCode = StatusCodes.Status401Unauthorized;
         await context.Response.WriteAsJsonAsync(new { error = "Invalid X-API-Key" });
+    }
+
+    private bool TryAuthenticateAdmin(HttpContext context)
+    {
+        if (!context.Request.Headers.TryGetValue(AdminKeyHeader, out var extractedKey)
+            || string.IsNullOrWhiteSpace(extractedKey))
+        {
+            return false;
+        }
+
+        if (!string.Equals(extractedKey.ToString(), _adminApiKey, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        context.Items[ClientIdKey] = AdminClientId;
+        return true;
     }
 }

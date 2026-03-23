@@ -1,76 +1,64 @@
 using System.Collections.Concurrent;
 using Microsoft.Extensions.Hosting;
-using Microsoft.Extensions.Logging;
 
 namespace PbiBridgeApi.Services;
 
-/// <summary>
-/// In-memory, thread-safe job manager.
-/// DA-014: strict isolation by client_id.
-/// DA-016: automatic cleanup of jobs older than 48h via background service.
-/// </summary>
-public sealed class JobManager : IJobManager
+public sealed class ValidationJobManager : IValidationJobManager
 {
-    // jobId -> JobRecord
-    private readonly ConcurrentDictionary<string, JobRecord> _jobs = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, ValidationJobRecord> _jobs = new(StringComparer.Ordinal);
 
-    public string CreateJob(string clientId)
+    public string CreateJob(string clientId, string artifactPath, string validator)
     {
         var jobId = Guid.NewGuid().ToString("N");
-        var record = new JobRecord
+        _jobs[jobId] = new ValidationJobRecord
         {
             JobId = jobId,
             ClientId = clientId,
-            Status = JobStatus.Pending,
-            CreatedAt = DateTime.UtcNow
+            ArtifactPath = artifactPath,
+            Validator = validator,
+            Status = ValidationStatus.Queued,
+            CreatedAt = DateTime.UtcNow,
         };
-        _jobs[jobId] = record;
         return jobId;
     }
 
-    /// <summary>
-    /// DA-014: Returns null for both "not found" and "client mismatch" — no information leakage.
-    /// </summary>
-    public JobRecord? GetJob(string jobId, string clientId)
+    public ValidationJobRecord? GetJob(string jobId, string clientId)
     {
         if (!_jobs.TryGetValue(jobId, out var record))
             return null;
 
-        // Strict isolation: return null if client_id does not match
         return record.ClientId == clientId ? record : null;
     }
 
-    /// <summary>DA-014: only returns jobs owned by clientId.</summary>
-    public IEnumerable<JobRecord> ListJobs(string clientId)
-        => _jobs.Values.Where(j => j.ClientId == clientId).ToList();
+    public IEnumerable<ValidationJobRecord> ListJobs(string clientId)
+        => _jobs.Values.Where(job => job.ClientId == clientId).ToList();
 
-    /// <summary>DA-014: update only if job exists and belongs to clientId.</summary>
-    public bool UpdateJob(string jobId, string clientId, JobStatus status,
-        string? result = null, string? error = null)
+    public bool UpdateJob(
+        string jobId,
+        string clientId,
+        ValidationStatus status,
+        string? error = null,
+        ValidationReportDocument? report = null)
     {
         if (!_jobs.TryGetValue(jobId, out var record))
             return false;
 
-        // Strict isolation: reject if client_id does not match
-        if (record.ClientId != clientId)
+        if (!string.Equals(record.ClientId, clientId, StringComparison.Ordinal))
             return false;
 
         record.Status = status;
-        record.Result = result;
         record.Error = error;
+        record.Report = report;
 
-        if (status == JobStatus.Running && record.StartedAt is null)
+        if (status == ValidationStatus.Running && record.StartedAt is null)
             record.StartedAt = DateTime.UtcNow;
 
-        if (status is JobStatus.Completed or JobStatus.Failed)
+        if (status.IsTerminal())
             record.CompletedAt = DateTime.UtcNow;
 
         return true;
     }
 
-    /// <summary>
-    /// DA-016: Remove all jobs older than 48h. Called by JobCleanupService.
-    /// </summary>
     internal void RemoveExpiredJobs(TimeSpan maxAge)
     {
         var cutoff = DateTime.UtcNow - maxAge;
@@ -82,30 +70,26 @@ public sealed class JobManager : IJobManager
     }
 }
 
-/// <summary>
-/// Background hosted service that cleans up jobs older than 48h every hour.
-/// DA-016: automatic cleanup — no memory leak.
-/// </summary>
-public sealed class JobCleanupService : BackgroundService
+public sealed class ValidationJobCleanupService : BackgroundService
 {
     private static readonly TimeSpan MaxJobAge = TimeSpan.FromHours(48);
     private static readonly TimeSpan CleanupInterval = TimeSpan.FromHours(1);
 
-    private readonly JobManager _jobManager;
-    private readonly ILogger<JobCleanupService> _logger;
+    private readonly ValidationJobManager _jobManager;
+    private readonly ILogger<ValidationJobCleanupService> _logger;
 
-    public JobCleanupService(IJobManager jobManager, ILogger<JobCleanupService> logger)
+    public ValidationJobCleanupService(IValidationJobManager jobManager, ILogger<ValidationJobCleanupService> logger)
     {
-        // We depend on the concrete type to access internal cleanup method.
-        // JobManager is registered as both IJobManager and JobManager (same singleton).
-        _jobManager = (JobManager)jobManager;
+        _jobManager = (ValidationJobManager)jobManager;
         _logger = logger;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        _logger.LogInformation("JobCleanupService started. Cleanup interval: {Interval}h, max age: {MaxAge}h",
-            CleanupInterval.TotalHours, MaxJobAge.TotalHours);
+        _logger.LogInformation(
+            "ValidationJobCleanupService started. Cleanup interval: {Interval}h, max age: {MaxAge}h",
+            CleanupInterval.TotalHours,
+            MaxJobAge.TotalHours);
 
         while (!stoppingToken.IsCancellationRequested)
         {
@@ -113,7 +97,7 @@ public sealed class JobCleanupService : BackgroundService
             {
                 await Task.Delay(CleanupInterval, stoppingToken);
                 _jobManager.RemoveExpiredJobs(MaxJobAge);
-                _logger.LogInformation("Job cleanup completed at {Now}", DateTime.UtcNow);
+                _logger.LogInformation("Validation job cleanup completed at {Now}", DateTime.UtcNow);
             }
             catch (OperationCanceledException)
             {
@@ -121,10 +105,10 @@ public sealed class JobCleanupService : BackgroundService
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Job cleanup error");
+                _logger.LogError(ex, "Validation job cleanup error");
             }
         }
 
-        _logger.LogInformation("JobCleanupService stopped.");
+        _logger.LogInformation("ValidationJobCleanupService stopped.");
     }
 }

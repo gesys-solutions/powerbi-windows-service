@@ -1,17 +1,19 @@
 namespace PbiBridgeApi.Services;
 
-/// <summary>
-/// Runs the tableau2pbi Python subprocess (DA-015: do NOT reimplement conversion logic).
-/// </summary>
-public interface IConversionService
+public interface IValidationService
 {
-    /// <summary>
-    /// Execute tableau2pbi conversion. Returns (stdout, stderr, exitCode).
-    /// Timeout: JobTimeoutMinutes (default 10).
-    /// </summary>
-    Task<(string Stdout, string Stderr, int ExitCode)> RunConversionAsync(
-        string sourcePath,
-        string outputPath,
-        Dictionary<string, object?> options,
+    Task<ValidationExecutionResult> RunValidationAsync(
+        string artifactPath,
+        string validator,
+        IReadOnlyDictionary<string, object?> options,
         CancellationToken cancellationToken = default);
+}
+
+public sealed class ValidationExecutionResult
+{
+    public ValidationStatus Status { get; init; } = ValidationStatus.Succeeded;
+    public string Validator { get; init; } = "contract-check";
+    public string Summary { get; init; } = string.Empty;
+    public string? Error { get; init; }
+    public List<ValidationCheckRecord> Checks { get; init; } = new();
 }

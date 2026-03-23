@@ -2,15 +2,14 @@ using System.Text.Json.Serialization;
 
 namespace PbiBridgeApi.Models;
 
-/// <summary>Response for POST /v1/migrate (202 Accepted).</summary>
-public sealed class MigrateResponse
+public sealed class ValidateResponse
 {
     [JsonPropertyName("job_id")]
     public string JobId { get; set; } = string.Empty;
 
-    [JsonPropertyName("status")]
-    public string Status { get; set; } = "pending";
+    [JsonPropertyName("validation_status")]
+    public string ValidationStatus { get; set; } = string.Empty;
 
     [JsonPropertyName("message")]
-    public string Message { get; set; } = "Conversion job queued.";
+    public string Message { get; set; } = "Validation job queued.";
 }

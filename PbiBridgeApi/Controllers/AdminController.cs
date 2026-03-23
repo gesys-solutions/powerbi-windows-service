@@ -4,9 +4,8 @@ using PbiBridgeApi.Services;
 namespace PbiBridgeApi.Controllers;
 
 /// <summary>
-/// Admin endpoints for client key management.
-/// Protected by ADMIN_API_KEY via ApiKeyMiddleware.
-/// DA-013, DA-017.
+/// Admin endpoints for managing client API keys.
+/// Protected by X-Admin-Key via ApiKeyMiddleware.
 /// </summary>
 [ApiController]
 [Route("admin")]
@@ -21,11 +20,9 @@ public class AdminController : ControllerBase
         _logger = logger;
     }
 
-    /// <summary>Ensure caller is admin (ADMIN_API_KEY injected as __admin__).</summary>
     private bool IsAdmin()
         => HttpContext.Items.TryGetValue("client_id", out var cid) && cid?.ToString() == "__admin__";
 
-    // POST /admin/clients — register a new client key
     [HttpPost("clients")]
     public IActionResult RegisterClient([FromBody] RegisterClientRequest request)
     {
@@ -46,7 +43,6 @@ public class AdminController : ControllerBase
         return Ok(new { message = $"Client '{request.ClientId}' registered successfully" });
     }
 
-    // DELETE /admin/clients/{clientId} — revoke a client key
     [HttpDelete("clients/{clientId}")]
     public IActionResult RevokeClient(string clientId)
     {
@@ -61,7 +57,6 @@ public class AdminController : ControllerBase
         return Ok(new { message = $"Client '{clientId}' revoked successfully" });
     }
 
-    // GET /admin/clients — list registered clients
     [HttpGet("clients")]
     public IActionResult ListClients()
     {

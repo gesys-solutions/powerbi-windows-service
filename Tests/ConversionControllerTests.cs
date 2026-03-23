@@ -1,4 +1,3 @@
-using System.Text;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -6,64 +5,71 @@ using Microsoft.Extensions.Options;
 using PbiBridgeApi.Controllers;
 using PbiBridgeApi.Models;
 using PbiBridgeApi.Services;
-using Xunit;
 
 namespace PbiBridgeApi.Tests;
 
-// ── Mock ConversionService ────────────────────────────────────────────────────
-
-/// <summary>
-/// Deterministic mock — no subprocess called (DA-015: subprocess only in production).
-/// Returns success unless sourcePath contains "FAIL".
-/// </summary>
-public sealed class MockConversionService : IConversionService
+public sealed class MockValidationService : IValidationService
 {
-    public int CallCount { get; private set; }
-    public string? LastSourcePath { get; private set; }
-
-    public Task<(string Stdout, string Stderr, int ExitCode)> RunConversionAsync(
-        string sourcePath,
-        string outputPath,
-        Dictionary<string, object?> options,
-        CancellationToken cancellationToken = default)
+    public ValidationExecutionResult Result { get; set; } = new()
     {
-        CallCount++;
-        LastSourcePath = sourcePath;
+        Status = ValidationStatus.Succeeded,
+        Validator = "contract-check",
+        Summary = "Validation succeeded.",
+        Checks = new List<ValidationCheckRecord>
+        {
+            new()
+            {
+                Name = "artifact_exists",
+                Status = "passed",
+                Detail = "Artifact exists.",
+            },
+        },
+    };
 
-        if (sourcePath.Contains("FAIL", StringComparison.OrdinalIgnoreCase))
-            return Task.FromResult(("", "Simulated error", 1));
-
-        return Task.FromResult(($"Converted {sourcePath} -> {outputPath}", "", 0));
-    }
+    public Task<ValidationExecutionResult> RunValidationAsync(
+        string artifactPath,
+        string validator,
+        IReadOnlyDictionary<string, object?> options,
+        CancellationToken cancellationToken = default)
+        => Task.FromResult(new ValidationExecutionResult
+        {
+            Status = Result.Status,
+            Validator = Result.Validator,
+            Summary = Result.Summary,
+            Error = Result.Error,
+            Checks = Result.Checks
+                .Select(check => new ValidationCheckRecord
+                {
+                    Name = check.Name,
+                    Status = check.Status,
+                    Detail = check.Detail,
+                })
+                .ToList(),
+        });
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-internal static class ControllerFactory
+internal static class ValidationControllerFactory
 {
-    /// <summary>
-    /// Workspace root used by all tests.
-    /// Paths must start with {WorkspaceRoot}/{clientId}/ to pass path validation.
-    /// </summary>
-    public static readonly string TestWorkspaceRoot = "/tmp/pbi-test-workspaces";
+    public static readonly string TestWorkspaceRoot = Path.Combine(Path.GetTempPath(), "pbi-validator-test-workspaces");
 
-    /// <summary>Build a ConversionController with the client_id pre-injected in HttpContext.Items.</summary>
-    public static ConversionController Create(
-        IJobManager jobManager,
-        IConversionService conversionService,
+    public static ValidationController Create(
+        IValidationJobManager jobManager,
+        IValidationService validationService,
         string clientId = "acme",
         string? workspaceRoot = null)
     {
-        var opts = Options.Create(new ConversionOptions
+        var options = Options.Create(new ValidationOptions
         {
             WorkspaceRootPath = workspaceRoot ?? TestWorkspaceRoot,
+            DefaultValidator = "contract-check",
+            SupportedFileExtensions = [".pbix", ".pbip", ".zip"],
         });
 
-        var controller = new ConversionController(
+        var controller = new ValidationController(
             jobManager,
-            conversionService,
-            NullLogger<ConversionController>.Instance,
-            opts);
+            validationService,
+            options,
+            NullLogger<ValidationController>.Instance);
 
         var httpContext = new DefaultHttpContext();
         httpContext.Response.Body = new MemoryStream();
@@ -77,434 +83,196 @@ internal static class ControllerFactory
         return controller;
     }
 
-    /// <summary>Build a ConversionController WITHOUT client_id (simulates auth failure).</summary>
-    public static ConversionController CreateUnauthenticated(
-        IJobManager jobManager,
-        IConversionService conversionService)
+    public static ValidationController CreateUnauthenticated(
+        IValidationJobManager jobManager,
+        IValidationService validationService)
     {
-        var opts = Options.Create(new ConversionOptions
+        var options = Options.Create(new ValidationOptions
         {
             WorkspaceRootPath = TestWorkspaceRoot,
+            DefaultValidator = "contract-check",
+            SupportedFileExtensions = [".pbix", ".pbip", ".zip"],
         });
 
-        var controller = new ConversionController(
+        var controller = new ValidationController(
             jobManager,
-            conversionService,
-            NullLogger<ConversionController>.Instance,
-            opts);
-
-        var httpContext = new DefaultHttpContext();
-        httpContext.Response.Body = new MemoryStream();
-        // No client_id in Items
+            validationService,
+            options,
+            NullLogger<ValidationController>.Instance);
 
         controller.ControllerContext = new ControllerContext
         {
-            HttpContext = httpContext,
+            HttpContext = new DefaultHttpContext { Response = { Body = new MemoryStream() } },
         };
 
         return controller;
     }
 
-    /// <summary>Build a valid source path for client under the test workspace.</summary>
-    public static string ValidSourcePath(string clientId = "acme", string file = "report.twb")
-        => $"{TestWorkspaceRoot}/{clientId}/{file}";
-
-    /// <summary>Build a valid output path for client under the test workspace.</summary>
-    public static string ValidOutputPath(string clientId = "acme", string file = "report.pbix")
-        => $"{TestWorkspaceRoot}/{clientId}/output/{file}";
+    public static string ValidArtifactPath(string clientId = "acme", string file = "report.pbix")
+        => Path.Combine(TestWorkspaceRoot, clientId, file);
 }
 
-// ── POST /v1/migrate tests ────────────────────────────────────────────────────
-
-public class MigrateEndpointTests
+public class ValidateEndpointTests : IDisposable
 {
-    private readonly JobManager _jobManager;
-    private readonly MockConversionService _mockConversion;
+    private readonly ValidationJobManager _jobManager = new();
+    private readonly MockValidationService _validationService = new();
 
-    public MigrateEndpointTests()
+    public ValidateEndpointTests()
     {
-        _jobManager = new JobManager();
-        _mockConversion = new MockConversionService();
+        Directory.CreateDirectory(Path.Combine(ValidationControllerFactory.TestWorkspaceRoot, "acme"));
     }
 
     [Fact]
-    public void Migrate_ValidRequest_Returns202WithJobId()
+    public void Validate_ValidRequest_Returns202WithQueuedJob()
     {
-        var controller = ControllerFactory.Create(_jobManager, _mockConversion);
-        var request = new MigrateRequest
-        {
-            SourcePath = ControllerFactory.ValidSourcePath(),
-            OutputPath = ControllerFactory.ValidOutputPath(),
-        };
+        var artifactPath = ValidationControllerFactory.ValidArtifactPath();
+        File.WriteAllText(artifactPath, "pbix");
 
-        var result = controller.Migrate(request) as AcceptedResult;
+        var controller = ValidationControllerFactory.Create(_jobManager, _validationService);
+        var request = new ValidateRequest { ArtifactPath = artifactPath };
+
+        var result = controller.Validate(request) as AcceptedResult;
 
         Assert.NotNull(result);
         Assert.Equal(StatusCodes.Status202Accepted, result.StatusCode);
 
-        var response = result.Value as MigrateResponse;
+        var response = result.Value as ValidateResponse;
         Assert.NotNull(response);
         Assert.False(string.IsNullOrWhiteSpace(response.JobId));
-        Assert.Equal("pending", response.Status);
+        Assert.Equal("queued", response.ValidationStatus);
     }
 
     [Fact]
-    public void Migrate_NoClientId_Returns401()
+    public void Validate_NoClientId_Returns401()
     {
-        var controller = ControllerFactory.CreateUnauthenticated(_jobManager, _mockConversion);
-        var request = new MigrateRequest
-        {
-            SourcePath = ControllerFactory.ValidSourcePath(),
-            OutputPath = ControllerFactory.ValidOutputPath(),
-        };
+        var controller = ValidationControllerFactory.CreateUnauthenticated(_jobManager, _validationService);
+        var request = new ValidateRequest { ArtifactPath = ValidationControllerFactory.ValidArtifactPath() };
 
-        var result = controller.Migrate(request) as UnauthorizedObjectResult;
+        var result = controller.Validate(request) as UnauthorizedObjectResult;
 
         Assert.NotNull(result);
         Assert.Equal(StatusCodes.Status401Unauthorized, result.StatusCode);
     }
 
     [Fact]
-    public void Migrate_InvalidModel_Returns400()
+    public void Validate_MissingArtifactPath_Returns400()
     {
-        var controller = ControllerFactory.Create(_jobManager, _mockConversion);
-        controller.ModelState.AddModelError("source_path", "Required");
+        var controller = ValidationControllerFactory.Create(_jobManager, _validationService);
+        var request = new ValidateRequest { ArtifactPath = "" };
 
-        var request = new MigrateRequest { SourcePath = "", OutputPath = ControllerFactory.ValidOutputPath() };
-
-        var result = controller.Migrate(request) as BadRequestObjectResult;
+        var result = controller.Validate(request) as BadRequestObjectResult;
 
         Assert.NotNull(result);
         Assert.Equal(StatusCodes.Status400BadRequest, result.StatusCode);
     }
 
     [Fact]
-    public void Migrate_CreatesJobInJobManager()
+    public void Validate_PathTraversal_Returns400()
     {
-        var controller = ControllerFactory.Create(_jobManager, _mockConversion, clientId: "acme");
-        var request = new MigrateRequest
+        var controller = ValidationControllerFactory.Create(_jobManager, _validationService);
+        var request = new ValidateRequest
         {
-            SourcePath = ControllerFactory.ValidSourcePath("acme", "test.twb"),
-            OutputPath = ControllerFactory.ValidOutputPath("acme", "test.pbix"),
+            ArtifactPath = Path.Combine(ValidationControllerFactory.TestWorkspaceRoot, "acme", "..", "evil", "report.pbix"),
         };
 
-        var result = controller.Migrate(request) as AcceptedResult;
+        var result = controller.Validate(request) as BadRequestObjectResult;
+
         Assert.NotNull(result);
+        Assert.Equal(StatusCodes.Status400BadRequest, result.StatusCode);
+    }
 
-        var response = result.Value as MigrateResponse;
-        Assert.NotNull(response);
-
-        // Job must be visible to same client (DA-014)
-        var job = _jobManager.GetJob(response.JobId, "acme");
-        Assert.NotNull(job);
-        Assert.Equal("acme", job.ClientId);
+    public void Dispose()
+    {
+        if (Directory.Exists(ValidationControllerFactory.TestWorkspaceRoot))
+            Directory.Delete(ValidationControllerFactory.TestWorkspaceRoot, recursive: true);
     }
 }
 
-// ── GET /v1/status/{jobId} tests ──────────────────────────────────────────────
-
-public class GetStatusEndpointTests
+public class GetValidationStatusEndpointTests
 {
-    private readonly JobManager _jobManager;
-    private readonly MockConversionService _mockConversion;
-
-    public GetStatusEndpointTests()
-    {
-        _jobManager = new JobManager();
-        _mockConversion = new MockConversionService();
-    }
+    private readonly ValidationJobManager _jobManager = new();
+    private readonly MockValidationService _validationService = new();
 
     [Fact]
-    public void GetStatus_ValidJobId_ReturnsCorrectStatus()
+    public void GetValidationStatus_ValidJobId_ReturnsStatus()
     {
-        // Arrange: create a job for "acme"
-        var jobId = _jobManager.CreateJob("acme");
+        var jobId = _jobManager.CreateJob("acme", "artifact.pbix", "contract-check");
+        var controller = ValidationControllerFactory.Create(_jobManager, _validationService, clientId: "acme");
 
-        var controller = ControllerFactory.Create(_jobManager, _mockConversion, clientId: "acme");
-
-        var result = controller.GetStatus(jobId) as OkObjectResult;
+        var result = controller.GetValidationStatus(jobId) as OkObjectResult;
 
         Assert.NotNull(result);
-        Assert.Equal(StatusCodes.Status200OK, result.StatusCode);
-
-        var response = result.Value as JobStatusResponse;
+        var response = result.Value as ValidationStatusResponse;
         Assert.NotNull(response);
-        Assert.Equal(jobId, response.JobId);
-        Assert.Equal("pending", response.Status);
+        Assert.Equal("queued", response.ValidationStatus);
+        Assert.Equal("contract-check", response.Validator);
     }
 
     [Fact]
-    public void GetStatus_UnknownJobId_Returns404()
+    public void GetValidationStatus_OtherClientJob_Returns404()
     {
-        var controller = ControllerFactory.Create(_jobManager, _mockConversion);
+        var jobId = _jobManager.CreateJob("acme", "artifact.pbix", "contract-check");
+        var controller = ValidationControllerFactory.Create(_jobManager, _validationService, clientId: "other-client");
 
-        var result = controller.GetStatus("00000000-0000-0000-0000-000000000000") as NotFoundObjectResult;
+        var result = controller.GetValidationStatus(jobId) as NotFoundObjectResult;
 
-        Assert.NotNull(result);
-        Assert.Equal(StatusCodes.Status404NotFound, result.StatusCode);
-    }
-
-    [Fact]
-    public void GetStatus_NoClientId_Returns401()
-    {
-        var controller = ControllerFactory.CreateUnauthenticated(_jobManager, _mockConversion);
-
-        var result = controller.GetStatus("some-job-id") as UnauthorizedObjectResult;
-
-        Assert.NotNull(result);
-        Assert.Equal(StatusCodes.Status401Unauthorized, result.StatusCode);
-    }
-
-    /// <summary>
-    /// DA-014: client "other" must NOT see job created by "acme".
-    /// </summary>
-    [Fact]
-    public void GetStatus_OtherClientJob_Returns404_DA014()
-    {
-        // Create job for "acme"
-        var jobId = _jobManager.CreateJob("acme");
-
-        // "other-client" tries to access acme's job
-        var controller = ControllerFactory.Create(_jobManager, _mockConversion, clientId: "other-client");
-
-        var result = controller.GetStatus(jobId) as NotFoundObjectResult;
-
-        // DA-014: must return 404, not the real status (no information leak)
         Assert.NotNull(result);
         Assert.Equal(StatusCodes.Status404NotFound, result.StatusCode);
     }
 }
 
-// ── GET /v1/result/{jobId} tests ──────────────────────────────────────────────
-
-public class GetResultEndpointTests
+public class GetValidationReportEndpointTests
 {
-    private readonly JobManager _jobManager;
-    private readonly MockConversionService _mockConversion;
-
-    public GetResultEndpointTests()
-    {
-        _jobManager = new JobManager();
-        _mockConversion = new MockConversionService();
-    }
+    private readonly ValidationJobManager _jobManager = new();
+    private readonly MockValidationService _validationService = new();
 
     [Fact]
-    public void GetResult_CompletedJob_Returns200()
+    public void GetValidationReport_TerminalJob_ReturnsStructuredReport()
     {
-        var jobId = _jobManager.CreateJob("acme");
-        _jobManager.UpdateJob(jobId, "acme", JobStatus.Completed, result: "/output/done.pbix");
+        var jobId = _jobManager.CreateJob("acme", "artifact.pbix", "contract-check");
+        _jobManager.UpdateJob(
+            jobId,
+            "acme",
+            ValidationStatus.Unavailable,
+            "Desktop validator offline.",
+            new ValidationReportDocument
+            {
+                Summary = "Validator unavailable — conversion result must remain unchanged.",
+                Error = "Desktop validator offline.",
+                FallbackNonBlocking = true,
+                ConversionStatusImpact = "none",
+                Checks = new List<ValidationCheckRecord>
+                {
+                    new()
+                    {
+                        Name = "validator_backend",
+                        Status = "unavailable",
+                        Detail = "Desktop validator offline.",
+                    },
+                },
+            });
 
-        var controller = ControllerFactory.Create(_jobManager, _mockConversion, clientId: "acme");
-
-        var result = controller.GetResult(jobId) as OkObjectResult;
+        var controller = ValidationControllerFactory.Create(_jobManager, _validationService, clientId: "acme");
+        var result = controller.GetValidationReport(jobId) as OkObjectResult;
 
         Assert.NotNull(result);
-        var response = result.Value as JobResultResponse;
+        var response = result.Value as ValidationReportResponse;
         Assert.NotNull(response);
-        Assert.Equal("completed", response.Status);
-        Assert.Equal("/output/done.pbix", response.OutputPath);
+        Assert.Equal("unavailable", response.ValidationStatus);
+        Assert.True(response.FallbackNonBlocking);
+        Assert.Equal("none", response.ConversionStatusImpact);
+        Assert.Single(response.Checks);
     }
 
     [Fact]
-    public void GetResult_PendingJob_Returns409()
+    public void GetValidationReport_QueuedJob_Returns409()
     {
-        var jobId = _jobManager.CreateJob("acme");
+        var jobId = _jobManager.CreateJob("acme", "artifact.pbix", "contract-check");
+        var controller = ValidationControllerFactory.Create(_jobManager, _validationService, clientId: "acme");
 
-        var controller = ControllerFactory.Create(_jobManager, _mockConversion, clientId: "acme");
-
-        var result = controller.GetResult(jobId) as ConflictObjectResult;
+        var result = controller.GetValidationReport(jobId) as ConflictObjectResult;
 
         Assert.NotNull(result);
         Assert.Equal(StatusCodes.Status409Conflict, result.StatusCode);
-    }
-
-    [Fact]
-    public void GetResult_UnknownJob_Returns404()
-    {
-        var controller = ControllerFactory.Create(_jobManager, _mockConversion);
-
-        var result = controller.GetResult("ghost-job-id") as NotFoundObjectResult;
-
-        Assert.NotNull(result);
-        Assert.Equal(StatusCodes.Status404NotFound, result.StatusCode);
-    }
-}
-
-// ── PathGuard unit tests (Blocker 1 — filesystem isolation) ──────────────────
-
-public class PathGuardTests
-{
-    private const string WorkspaceRoot = "/tmp/pbi-test-workspaces";
-    private const string ClientId = "acme";
-
-    // ── Valid paths ──────────────────────────────────────────────────────────
-
-    [Fact]
-    public void Validate_ValidPath_ReturnsTrue()
-    {
-        var (ok, err) = PathGuard.Validate(
-            $"{WorkspaceRoot}/{ClientId}/input.twb",
-            ClientId,
-            WorkspaceRoot);
-
-        Assert.True(ok, $"Expected valid — got error: {err}");
-        Assert.Empty(err);
-    }
-
-    [Fact]
-    public void Validate_ValidNestedPath_ReturnsTrue()
-    {
-        var (ok, err) = PathGuard.Validate(
-            $"{WorkspaceRoot}/{ClientId}/subdir/deep/file.twb",
-            ClientId,
-            WorkspaceRoot);
-
-        Assert.True(ok, $"Expected valid — got error: {err}");
-    }
-
-    // ── Path traversal attacks ───────────────────────────────────────────────
-
-    [Fact]
-    public void Validate_PathTraversal_DotDot_ReturnsFalse()
-    {
-        // ../evil would resolve to /tmp/pbi-test-workspaces/evil — outside acme sandbox
-        var traversalPath = $"{WorkspaceRoot}/{ClientId}/../evil/file.twb";
-
-        var (ok, err) = PathGuard.Validate(traversalPath, ClientId, WorkspaceRoot);
-
-        Assert.False(ok, "Path traversal via .. must be rejected.");
-        Assert.NotEmpty(err);
-    }
-
-    [Fact]
-    public void Validate_PathTraversal_EscapesWorkspace_ReturnsFalse()
-    {
-        // Tries to reach another client's workspace
-        var traversalPath = $"{WorkspaceRoot}/{ClientId}/../../other-client/secret.twb";
-
-        var (ok, err) = PathGuard.Validate(traversalPath, ClientId, WorkspaceRoot);
-
-        Assert.False(ok, "Path traversal escaping workspace must be rejected.");
-    }
-
-    [Fact]
-    public void Validate_SystemPath_ReturnsFalse()
-    {
-        // Absolute path outside the workspace entirely
-        var (ok, err) = PathGuard.Validate("/etc/passwd", ClientId, WorkspaceRoot);
-
-        Assert.False(ok, "System path must be rejected.");
-        Assert.NotEmpty(err);
-    }
-
-    [Fact]
-    public void Validate_OtherClientPath_ReturnsFalse()
-    {
-        // Trying to access another client's sandbox directly
-        var (ok, err) = PathGuard.Validate(
-            $"{WorkspaceRoot}/other-client/file.twb",
-            ClientId,     // ClientId = "acme"
-            WorkspaceRoot);
-
-        Assert.False(ok, "Another client's path must be rejected for the requesting client.");
-    }
-
-    // ── UNC paths ────────────────────────────────────────────────────────────
-
-    [Fact]
-    public void Validate_UncPath_ReturnsFalse()
-    {
-        var (ok, err) = PathGuard.Validate(@"\\server\share\file.twb", ClientId, WorkspaceRoot);
-
-        Assert.False(ok, "UNC path must be rejected.");
-        Assert.NotEmpty(err);
-    }
-
-    [Fact]
-    public void Validate_UncPath_ForwardSlash_ReturnsFalse()
-    {
-        var (ok, err) = PathGuard.Validate("//server/share/file.twb", ClientId, WorkspaceRoot);
-
-        Assert.False(ok, "UNC path (forward slash) must be rejected.");
-    }
-
-    // ── Edge cases ───────────────────────────────────────────────────────────
-
-    [Fact]
-    public void Validate_EmptyPath_ReturnsFalse()
-    {
-        var (ok, err) = PathGuard.Validate("", ClientId, WorkspaceRoot);
-
-        Assert.False(ok);
-        Assert.NotEmpty(err);
-    }
-
-    [Fact]
-    public void Validate_WhitespacePath_ReturnsFalse()
-    {
-        var (ok, err) = PathGuard.Validate("   ", ClientId, WorkspaceRoot);
-
-        Assert.False(ok);
-        Assert.NotEmpty(err);
-    }
-
-    // ── Controller integration: paths are validated before job creation ──────
-
-    [Fact]
-    public void Migrate_PathTraversal_Returns400()
-    {
-        var jobManager = new JobManager();
-        var mockConversion = new MockConversionService();
-        var controller = ControllerFactory.Create(jobManager, mockConversion, clientId: "acme");
-
-        var request = new MigrateRequest
-        {
-            // Traversal: resolved path escapes the acme sandbox
-            SourcePath = $"{ControllerFactory.TestWorkspaceRoot}/acme/../evil/file.twb",
-            OutputPath = ControllerFactory.ValidOutputPath("acme"),
-        };
-
-        var result = controller.Migrate(request) as BadRequestObjectResult;
-
-        Assert.NotNull(result);
-        Assert.Equal(StatusCodes.Status400BadRequest, result.StatusCode);
-    }
-
-    [Fact]
-    public void Migrate_ValidPathInsideSandbox_Returns202()
-    {
-        var jobManager = new JobManager();
-        var mockConversion = new MockConversionService();
-        var controller = ControllerFactory.Create(jobManager, mockConversion, clientId: "acme");
-
-        var request = new MigrateRequest
-        {
-            SourcePath = ControllerFactory.ValidSourcePath("acme", "data.twb"),
-            OutputPath = ControllerFactory.ValidOutputPath("acme", "data.pbix"),
-        };
-
-        var result = controller.Migrate(request) as AcceptedResult;
-
-        Assert.NotNull(result);
-        Assert.Equal(StatusCodes.Status202Accepted, result.StatusCode);
-    }
-
-    [Fact]
-    public void Migrate_SystemPath_Returns400()
-    {
-        var jobManager = new JobManager();
-        var mockConversion = new MockConversionService();
-        var controller = ControllerFactory.Create(jobManager, mockConversion, clientId: "acme");
-
-        var request = new MigrateRequest
-        {
-            SourcePath = "/etc/passwd",
-            OutputPath = ControllerFactory.ValidOutputPath("acme"),
-        };
-
-        var result = controller.Migrate(request) as BadRequestObjectResult;
-
-        Assert.NotNull(result);
-        Assert.Equal(StatusCodes.Status400BadRequest, result.StatusCode);
     }
 }

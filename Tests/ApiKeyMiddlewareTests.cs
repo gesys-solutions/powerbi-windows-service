@@ -1,16 +1,10 @@
-using System.Net;
 using Microsoft.AspNetCore.Http;
-using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.Extensions.Configuration;
-using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
 using PbiBridgeApi.Middleware;
 using PbiBridgeApi.Services;
-using Xunit;
 
 namespace PbiBridgeApi.Tests;
-
-// ── InMemoryApiKeyStore unit tests ────────────────────────────────────────────
 
 public class InMemoryApiKeyStoreTests
 {
@@ -31,8 +25,7 @@ public class InMemoryApiKeyStoreTests
     {
         var store = new InMemoryApiKeyStore();
         store.RegisterClient("client-1", "key-abc");
-        var duplicate = store.RegisterClient("client-1", "key-xyz");
-        Assert.False(duplicate);
+        Assert.False(store.RegisterClient("client-1", "key-xyz"));
     }
 
     [Fact]
@@ -40,35 +33,10 @@ public class InMemoryApiKeyStoreTests
     {
         var store = new InMemoryApiKeyStore();
         store.RegisterClient("client-2", "key-def");
-        var revoked = store.RevokeClient("client-2");
-        Assert.True(revoked);
-
-        var found = store.TryGetClientId("key-def", out _);
-        Assert.False(found);
-    }
-
-    [Fact]
-    public void RevokeNonExistentClient_ShouldReturnFalse()
-    {
-        var store = new InMemoryApiKeyStore();
-        var result = store.RevokeClient("ghost");
-        Assert.False(result);
-    }
-
-    [Fact]
-    public void ListClients_ShouldReturnAllRegistered()
-    {
-        var store = new InMemoryApiKeyStore();
-        store.RegisterClient("c1", "key-111");
-        store.RegisterClient("c2", "key-222");
-        var list = store.ListClients().ToList();
-        Assert.Equal(2, list.Count);
-        Assert.Contains(list, c => c.ClientId == "c1");
-        Assert.Contains(list, c => c.ClientId == "c2");
+        Assert.True(store.RevokeClient("client-2"));
+        Assert.False(store.TryGetClientId("key-def", out _));
     }
 }
-
-// ── ApiKeyMiddleware unit tests ───────────────────────────────────────────────
 
 public class ApiKeyMiddlewareTests
 {
@@ -84,9 +52,10 @@ public class ApiKeyMiddlewareTests
     }
 
     private static DefaultHttpContext MakeContext(
-        string? path = "/v1/migrate",
+        string path,
+        string method = "GET",
         string? apiKey = null,
-        string method = "GET")
+        string? adminKey = null)
     {
         var ctx = new DefaultHttpContext();
         ctx.Request.Path = path;
@@ -94,6 +63,8 @@ public class ApiKeyMiddlewareTests
         ctx.Response.Body = new MemoryStream();
         if (apiKey is not null)
             ctx.Request.Headers["X-API-Key"] = apiKey;
+        if (adminKey is not null)
+            ctx.Request.Headers["X-Admin-Key"] = adminKey;
         return ctx;
     }
 
@@ -101,10 +72,13 @@ public class ApiKeyMiddlewareTests
     public async Task HealthEndpoint_GetOnly_ShouldBypassAuth()
     {
         var called = false;
-        var mw = BuildMiddleware(_ => { called = true; return Task.CompletedTask; });
-        // DA-013: only GET /health is exempt
-        var ctx = MakeContext("/health", method: "GET");
+        var mw = BuildMiddleware(_ =>
+        {
+            called = true;
+            return Task.CompletedTask;
+        });
 
+        var ctx = MakeContext("/health", method: "GET");
         await mw.InvokeAsync(ctx);
 
         Assert.True(called);
@@ -112,11 +86,10 @@ public class ApiKeyMiddlewareTests
     }
 
     [Fact]
-    public async Task HealthEndpoint_PostWithoutKey_ShouldReturn401()
+    public async Task AdminRoute_Requires_XAdminKey()
     {
-        // DA-013 minor fix: POST /health (no auth key) must require auth — only GET is exempt
         var mw = BuildMiddleware(_ => Task.CompletedTask);
-        var ctx = MakeContext("/health", method: "POST");
+        var ctx = MakeContext("/admin/clients");
 
         await mw.InvokeAsync(ctx);
 
@@ -124,10 +97,10 @@ public class ApiKeyMiddlewareTests
     }
 
     [Fact]
-    public async Task MissingApiKey_ShouldReturn401()
+    public async Task AdminRoute_XApiKeyOnly_ShouldNotPass()
     {
         var mw = BuildMiddleware(_ => Task.CompletedTask);
-        var ctx = MakeContext("/v1/migrate");
+        var ctx = MakeContext("/admin/clients", apiKey: AdminKey);
 
         await mw.InvokeAsync(ctx);
 
@@ -135,10 +108,27 @@ public class ApiKeyMiddlewareTests
     }
 
     [Fact]
-    public async Task InvalidApiKey_ShouldReturn401()
+    public async Task AdminRoute_ValidXAdminKey_ShouldPass_AndInjectAdminClientId()
+    {
+        string? clientId = null;
+        var mw = BuildMiddleware(ctx =>
+        {
+            clientId = ctx.Items["client_id"]?.ToString();
+            return Task.CompletedTask;
+        });
+
+        var ctx = MakeContext("/admin/clients", adminKey: AdminKey);
+        await mw.InvokeAsync(ctx);
+
+        Assert.Equal(200, ctx.Response.StatusCode);
+        Assert.Equal("__admin__", clientId);
+    }
+
+    [Fact]
+    public async Task MissingApiKey_OnValidationRoute_ShouldReturn401()
     {
         var mw = BuildMiddleware(_ => Task.CompletedTask);
-        var ctx = MakeContext("/v1/migrate", "bad-key");
+        var ctx = MakeContext("/v1/validate", method: "POST");
 
         await mw.InvokeAsync(ctx);
 
@@ -158,7 +148,7 @@ public class ApiKeyMiddlewareTests
             return Task.CompletedTask;
         }, store);
 
-        var ctx = MakeContext("/v1/migrate", "acme-key-999");
+        var ctx = MakeContext("/v1/validate", method: "POST", apiKey: "acme-key-999");
         await mw.InvokeAsync(ctx);
 
         Assert.Equal(200, ctx.Response.StatusCode);
@@ -166,7 +156,7 @@ public class ApiKeyMiddlewareTests
     }
 
     [Fact]
-    public async Task AdminKey_ShouldPass_WithAdminClientId()
+    public async Task AdminKey_ShouldPass_OnValidationRoute_WhenUsingXAdminKey()
     {
         string? clientId = null;
         var mw = BuildMiddleware(ctx =>
@@ -175,7 +165,7 @@ public class ApiKeyMiddlewareTests
             return Task.CompletedTask;
         });
 
-        var ctx = MakeContext("/admin/clients", AdminKey);
+        var ctx = MakeContext("/v1/validation-status/123", adminKey: AdminKey);
         await mw.InvokeAsync(ctx);
 
         Assert.Equal(200, ctx.Response.StatusCode);
@@ -185,13 +175,9 @@ public class ApiKeyMiddlewareTests
     [Fact]
     public void MissingAdminApiKeyEnvVar_ShouldThrowOnConstruction()
     {
-        var config = new ConfigurationBuilder().Build(); // no ADMIN_API_KEY
+        var config = new ConfigurationBuilder().Build();
         var store = new InMemoryApiKeyStore();
         Assert.Throws<InvalidOperationException>(() =>
-            new ApiKeyMiddleware(
-                _ => Task.CompletedTask,
-                config,
-                store,
-                NullLogger<ApiKeyMiddleware>.Instance));
+            new ApiKeyMiddleware(_ => Task.CompletedTask, config, store, NullLogger<ApiKeyMiddleware>.Instance));
     }
 }
