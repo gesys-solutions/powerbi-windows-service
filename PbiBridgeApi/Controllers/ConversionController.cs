@@ -13,6 +13,7 @@ namespace PbiBridgeApi.Controllers;
 public class ValidationController : ControllerBase
 {
     private const string ClientIdKey = "client_id";
+    private const string AdminClientId = "__admin__";
 
     private readonly IValidationJobManager _jobManager;
     private readonly IValidationService _validationService;
@@ -35,11 +36,15 @@ public class ValidationController : ControllerBase
     [ProducesResponseType(typeof(ValidateResponse), StatusCodes.Status202Accepted)]
     [ProducesResponseType(StatusCodes.Status400BadRequest)]
     [ProducesResponseType(StatusCodes.Status401Unauthorized)]
+    [ProducesResponseType(StatusCodes.Status403Forbidden)]
     public IActionResult Validate([FromBody] ValidateRequest request)
     {
         var clientId = GetClientId();
         if (clientId is null)
             return Unauthorized(new { error = "client_id missing — auth middleware failed" });
+
+        if (IsAdminClient(clientId))
+            return StatusCode(StatusCodes.Status403Forbidden, new { error = "X-Admin-Key is read-only on /v1/* diagnostics. Use X-API-Key to queue a validation job." });
 
         if (!ModelState.IsValid || string.IsNullOrWhiteSpace(request.ArtifactPath))
             return BadRequest(new { error = "artifact_path is required" });
@@ -81,7 +86,7 @@ public class ValidationController : ControllerBase
         if (clientId is null)
             return Unauthorized(new { error = "client_id missing — auth middleware failed" });
 
-        var job = _jobManager.GetJob(jobId, clientId);
+        var job = _jobManager.GetJob(jobId, clientId, allowAdminOverride: IsAdminClient(clientId));
         if (job is null)
             return NotFound(new { error = $"Validation job '{jobId}' not found." });
 
@@ -108,7 +113,7 @@ public class ValidationController : ControllerBase
         if (clientId is null)
             return Unauthorized(new { error = "client_id missing — auth middleware failed" });
 
-        var job = _jobManager.GetJob(jobId, clientId);
+        var job = _jobManager.GetJob(jobId, clientId, allowAdminOverride: IsAdminClient(clientId));
         if (job is null)
             return NotFound(new { error = $"Validation job '{jobId}' not found." });
 
@@ -149,6 +154,9 @@ public class ValidationController : ControllerBase
 
     private string? GetClientId() =>
         HttpContext.Items.TryGetValue(ClientIdKey, out var value) ? value as string : null;
+
+    private static bool IsAdminClient(string clientId)
+        => string.Equals(clientId, AdminClientId, StringComparison.Ordinal);
 
     private async Task RunValidationBackgroundAsync(
         string jobId,

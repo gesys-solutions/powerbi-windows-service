@@ -6,7 +6,8 @@ namespace PbiBridgeApi.Middleware;
 /// Auth contract:
 /// - GET /health: anonymous
 /// - /admin/*: X-Admin-Key
-/// - /v1/*: X-API-Key (client) or X-Admin-Key (operator)
+/// - POST /v1/validate: X-API-Key (client)
+/// - GET /v1/validation-status|validation-report: X-API-Key (client) or X-Admin-Key (operator diagnostic, read-only)
 /// </summary>
 public class ApiKeyMiddleware
 {

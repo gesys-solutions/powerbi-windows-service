@@ -167,6 +167,22 @@ public class ValidateEndpointTests : IDisposable
     }
 
     [Fact]
+    public void Validate_AdminDiagnosticKey_Returns403()
+    {
+        var artifactPath = ValidationControllerFactory.ValidArtifactPath(clientId: "__admin__");
+        Directory.CreateDirectory(Path.GetDirectoryName(artifactPath)!);
+        File.WriteAllText(artifactPath, "pbix");
+
+        var controller = ValidationControllerFactory.Create(_jobManager, _validationService, clientId: "__admin__");
+        var request = new ValidateRequest { ArtifactPath = artifactPath };
+
+        var result = controller.Validate(request) as ObjectResult;
+
+        Assert.NotNull(result);
+        Assert.Equal(StatusCodes.Status403Forbidden, result.StatusCode);
+    }
+
+    [Fact]
     public void Validate_PathTraversal_Returns400()
     {
         var controller = ValidationControllerFactory.Create(_jobManager, _validationService);
@@ -218,6 +234,21 @@ public class GetValidationStatusEndpointTests
 
         Assert.NotNull(result);
         Assert.Equal(StatusCodes.Status404NotFound, result.StatusCode);
+    }
+
+    [Fact]
+    public void GetValidationStatus_AdminDiagnosticKey_CanReadClientJob()
+    {
+        var jobId = _jobManager.CreateJob("acme", "artifact.pbix", "contract-check");
+        var controller = ValidationControllerFactory.Create(_jobManager, _validationService, clientId: "__admin__");
+
+        var result = controller.GetValidationStatus(jobId) as OkObjectResult;
+
+        Assert.NotNull(result);
+        var response = result.Value as ValidationStatusResponse;
+        Assert.NotNull(response);
+        Assert.Equal(jobId, response.JobId);
+        Assert.Equal("queued", response.ValidationStatus);
     }
 }
 
@@ -274,5 +305,32 @@ public class GetValidationReportEndpointTests
 
         Assert.NotNull(result);
         Assert.Equal(StatusCodes.Status409Conflict, result.StatusCode);
+    }
+
+    [Fact]
+    public void GetValidationReport_AdminDiagnosticKey_CanReadClientJob()
+    {
+        var jobId = _jobManager.CreateJob("acme", "artifact.pbix", "contract-check");
+        _jobManager.UpdateJob(
+            jobId,
+            "acme",
+            ValidationStatus.Succeeded,
+            report: new ValidationReportDocument
+            {
+                Summary = "Validation succeeded.",
+                FallbackNonBlocking = true,
+                ConversionStatusImpact = "none",
+                Checks = new List<ValidationCheckRecord>(),
+            });
+
+        var controller = ValidationControllerFactory.Create(_jobManager, _validationService, clientId: "__admin__");
+        var result = controller.GetValidationReport(jobId) as OkObjectResult;
+
+        Assert.NotNull(result);
+        var response = result.Value as ValidationReportResponse;
+        Assert.NotNull(response);
+        Assert.Equal(jobId, response.JobId);
+        Assert.Equal("succeeded", response.ValidationStatus);
+        Assert.True(response.FallbackNonBlocking);
     }
 }

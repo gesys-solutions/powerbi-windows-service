@@ -5,6 +5,8 @@ namespace PbiBridgeApi.Services;
 
 public sealed class ValidationJobManager : IValidationJobManager
 {
+    private const string AdminClientId = "__admin__";
+
     private readonly ConcurrentDictionary<string, ValidationJobRecord> _jobs = new(StringComparer.Ordinal);
 
     public string CreateJob(string clientId, string artifactPath, string validator)
@@ -22,12 +24,18 @@ public sealed class ValidationJobManager : IValidationJobManager
         return jobId;
     }
 
-    public ValidationJobRecord? GetJob(string jobId, string clientId)
+    public ValidationJobRecord? GetJob(string jobId, string requesterClientId, bool allowAdminOverride = false)
     {
         if (!_jobs.TryGetValue(jobId, out var record))
             return null;
 
-        return record.ClientId == clientId ? record : null;
+        if (string.Equals(record.ClientId, requesterClientId, StringComparison.Ordinal))
+            return record;
+
+        if (allowAdminOverride && string.Equals(requesterClientId, AdminClientId, StringComparison.Ordinal))
+            return record;
+
+        return null;
     }
 
     public IEnumerable<ValidationJobRecord> ListJobs(string clientId)

@@ -18,9 +18,12 @@ Ce service expose uniquement :
 |---|---|
 | `GET /health` | aucun |
 | `/admin/*` | `X-Admin-Key: <ADMIN_API_KEY>` |
-| `/v1/*` | `X-API-Key: <client-api-key>` |
+| `POST /v1/validate` | `X-API-Key: <client-api-key>` |
+| `GET /v1/validation-status/{jobId}` | `X-API-Key: <client-api-key>` ou `X-Admin-Key: <ADMIN_API_KEY>` (diagnostic read-only) |
+| `GET /v1/validation-report/{jobId}` | `X-API-Key: <client-api-key>` ou `X-Admin-Key: <ADMIN_API_KEY>` (diagnostic read-only) |
 
-`X-Admin-Key` peut aussi être utilisé par un opérateur pour appeler `/v1/*` en diagnostic.
+`X-Admin-Key` ne peut pas créer de job de validation via `POST /v1/validate`.
+Il sert uniquement au diagnostic opérateur read-only sur `validation-status` et `validation-report`.
 
 ## Contrat de validation
 
@@ -64,6 +67,12 @@ GET /v1/validation-status/{jobId}
 X-API-Key: client-key
 ```
 
+Ou, pour diagnostic opérateur read-only :
+```http
+GET /v1/validation-status/{jobId}
+X-Admin-Key: <ADMIN_API_KEY>
+```
+
 Réponse :
 ```json
 {
@@ -81,6 +90,12 @@ Réponse :
 ```http
 GET /v1/validation-report/{jobId}
 X-API-Key: client-key
+```
+
+Ou, pour diagnostic opérateur read-only :
+```http
+GET /v1/validation-report/{jobId}
+X-Admin-Key: <ADMIN_API_KEY>
 ```
 
 Réponse :
@@ -176,9 +191,11 @@ DOTNET_ENVIRONMENT=Development dotnet run
 
 ## Build / tests
 
+Depuis la racine du repo :
+
 ```bash
-dotnet test
-dotnet build
+dotnet build PbiBridgeApi/PbiBridgeApi.csproj
+dotnet test Tests/PbiBridgeApi.Tests.csproj
 ```
 
 ## Notes d'intégration EPIC-5

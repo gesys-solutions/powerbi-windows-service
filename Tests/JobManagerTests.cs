@@ -27,6 +27,18 @@ public class ValidationJobManagerTests
     }
 
     [Fact]
+    public void GetJob_AdminOverride_ReturnsRecord_WhenExplicitlyAllowed()
+    {
+        var manager = CreateManager();
+        var jobId = manager.CreateJob("client-A", "artifact.pbix", "contract-check");
+
+        var record = manager.GetJob(jobId, "__admin__", allowAdminOverride: true);
+
+        Assert.NotNull(record);
+        Assert.Equal("client-A", record!.ClientId);
+    }
+
+    [Fact]
     public void ListJobs_ReturnsOnlyClientOwnedJobs()
     {
         var manager = CreateManager();
